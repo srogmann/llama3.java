@@ -18,16 +18,17 @@
 // Enjoy!
 package com.llama4j;
 
-import jdk.incubator.vector.ByteVector;
-import jdk.incubator.vector.FloatVector;
-import jdk.incubator.vector.VectorOperators;
-import jdk.incubator.vector.VectorSpecies;
-
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
@@ -35,7 +36,16 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.OptionalInt;
+import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
@@ -46,6 +56,13 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
+
+import javax.net.ServerSocketFactory;
+
+import jdk.incubator.vector.ByteVector;
+import jdk.incubator.vector.FloatVector;
+import jdk.incubator.vector.VectorOperators;
+import jdk.incubator.vector.VectorSpecies;
 
 public class Llama3 {
 
@@ -154,7 +171,145 @@ public class Llama3 {
         }
     }
 
-    record Options(Path modelPath, String prompt, String systemPrompt, boolean interactive,
+    static void startLlmServer(Llama model, Sampler sampler, Options options) {
+        Matcher mServer = Pattern.compile("(.*):([0-9]{1,5})").matcher(options.serverHostPort());
+        if (!mServer.matches()) {
+            throw new IllegalArgumentException("Invalid argument --server <host>:<port>: " + options.serverHostPort());
+        }
+        final String bindIp = mServer.group(1);
+        final int bindPort = Integer.parseInt(mServer.group(2));
+        System.out.println(String.format("Start LLM-server at %s:%d", bindIp, bindPort));
+        try (ServerSocket serverSocket = ServerSocketFactory.getDefault().createServerSocket()) {
+            SocketAddress endpoint = new InetSocketAddress(bindIp, bindPort);
+            serverSocket.bind(endpoint);
+            while (true) {
+                // We don't support parallel connections.
+                try (Socket socket = serverSocket.accept()) {
+                    System.out.println(String.format("LLM-Connect by: %s", socket.getRemoteSocketAddress()));
+                    socket.setSoTimeout(3000);
+                    // Receive header.
+                    final String systemPrompt;
+                    final String prompt;
+                    try (InputStream is = socket.getInputStream()) {
+                        final byte[] bufHeader = new byte[5];
+                        readBuf(is, bufHeader, 5);
+                        final String eyecatcher = new String(bufHeader, 0, 4, StandardCharsets.ISO_8859_1);
+                        if (!"LLM1".equals(eyecatcher)) {
+                            throw new IOException("Invalid eyecatcher: " + eyecatcher);
+                        }
+                        byte chunkId = bufHeader[4];
+                        if (chunkId != 0x01) { // 0x01 = begin-of-request
+                            throw new IOException("Invalid BOR-chunk-id: " + chunkId);
+                        }
+                        readBuf(is, bufHeader, 1);
+                        final byte taskType = bufHeader[0];
+                        if (taskType != 0x01) { // 0x01 = prompt (0x02 = fill-in-middle)
+                            throw new IOException("Unsupported task-type: " + taskType);
+                        }
+                        // Read system-prompt.
+                        readBuf(is, bufHeader, 5);
+                        chunkId = bufHeader[0];
+                        if (chunkId != 0x04) { // 0x04 = system-prompt-string
+                            throw new IOException("Invalid system-prompt-chunk-id: " + chunkId);
+                        }
+                        systemPrompt = readString(bufHeader, 1, is);
+                        // Read prompt.
+                        readBuf(is, bufHeader, 5);
+                        chunkId = bufHeader[0];
+                        if (chunkId != 0x05) { // 0x05 = prompt-string
+                            throw new IOException("Invalid prompt-chunk-id: " + chunkId);
+                        }
+                        prompt = readString(bufHeader, 1, is);
+                        // End-of-request.
+                        readBuf(is, bufHeader, 1);
+                        chunkId = bufHeader[0];
+                        if (chunkId != 0x02) { // 0x02 = end-of-request
+                            throw new IOException("Invalid EOR-chunk-id: " + chunkId);
+                        }
+
+                        Llama.State state = model.createNewState();
+                        ChatFormat chatFormat = new ChatFormat(model.tokenizer());
+
+                        List<Integer> promptTokens = new ArrayList<>();
+                        promptTokens.add(chatFormat.beginOfText);
+                        if (systemPrompt.length() > 0) {
+                            System.out.println("System-prompt: " + systemPrompt);
+                            promptTokens.addAll(chatFormat.encodeMessage(new ChatFormat.Message(ChatFormat.Role.SYSTEM, systemPrompt)));
+                        }
+                        System.out.println("Prompt: " + prompt);
+                        promptTokens.addAll(chatFormat.encodeMessage(new ChatFormat.Message(ChatFormat.Role.USER, prompt)));
+                        promptTokens.addAll(chatFormat.encodeHeader(new ChatFormat.Message(ChatFormat.Role.ASSISTANT, "")));
+
+                        System.out.println("Response:");
+                        try (OutputStream os = socket.getOutputStream()) {
+                            os.write("LLM1".getBytes(StandardCharsets.ISO_8859_1)); // send eye-catcher
+                            
+                            Set<Integer> stopTokens = chatFormat.getStopTokens();
+                            List<Integer> responseTokens = Llama.generateTokens(model, state, 0, promptTokens, stopTokens, options.maxTokens(), sampler, options.echo(), token -> {
+                                if (!model.tokenizer().isSpecialToken(token)) {
+                                    final String sToken = model.tokenizer().decode(List.of(token));
+                                    System.out.print(sToken);
+                                    byte[] bufToken = sToken.getBytes(StandardCharsets.UTF_8);
+                                    int lenToken = bufToken.length;
+                                    if (lenToken > 127) {
+                                        throw new IllegalStateException(String.format("Token too long (%d): %s", lenToken, sToken));
+                                    }
+                                    byte[] bufLenAndToken = new byte[1 + lenToken];
+                                    bufLenAndToken[0] = (byte) lenToken;
+                                    System.arraycopy(bufToken, 0, bufLenAndToken, 1, lenToken);
+                                    try {
+                                        os.write(bufLenAndToken);
+                                        os.flush();
+                                    } catch (IOException e) {
+                                        throw new RuntimeException("IO-Error while sending token: " + sToken, e);
+                                    }
+                                }
+                            });
+                            if (!responseTokens.isEmpty() && stopTokens.contains(responseTokens.getLast())) {
+                                responseTokens.removeLast();
+                            }
+                            os.write((int) 0); // send EOF
+                            
+                            // Close connection.
+                            readBuf(is, bufHeader, 1);
+                            chunkId = bufHeader[0];
+                            if (chunkId != 0x03) { // 0x03 = close-connection
+                                throw new IOException("Invalid close-connection-id: " + chunkId);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(String.format("IO-Exception in server %s:%d", bindIp, bindPort), e);
+        }
+    }
+    
+    static void readBuf(InputStream is, byte[] buf, int len) throws IOException {
+        int offset = 0;
+        while (offset < len) {
+            int lenPart = is.read(buf, offset, len - offset);
+            if (lenPart == -1) {
+                break;
+            }
+            offset += lenPart;
+        }
+        if (offset < len) {
+            throw new IOException(String.format("Unexpected end of stream while reading: %d < %d", offset, len));
+        }
+    }
+    
+    static String readString(byte[] buf, int offsetLen, InputStream is) throws IOException {
+        final int lenPrompt = ((buf[offsetLen] & 0xff) << 24)
+                + ((buf[offsetLen + 1] & 0xff) << 16)
+                + ((buf[offsetLen + 2] & 0xff) << 8)
+                + ( buf[offsetLen + 3] & 0xff);
+        final byte[] bufString = new byte[lenPrompt];
+        readBuf(is, bufString, lenPrompt);
+        return new String(bufString, StandardCharsets.UTF_8);
+    }
+
+    record Options(Path modelPath, String prompt, String systemPrompt, boolean interactive, String serverHostPort,
                    float temperature, float topp, long seed, int maxTokens, boolean stream, boolean echo) {
 
         Options {
@@ -180,6 +335,7 @@ public class Llama3 {
             out.println("  --model, -m <path>            required, path to .gguf file");
             out.println("  --interactive, --chat, -i     run in chat mode");
             out.println("  --instruct                    run in instruct (once) mode, default mode");
+            out.println("  --server <host>:<port>        run in server mode");
             out.println("  --prompt, -p <string>         input prompt");
             out.println("  --system-prompt, -sp <string> (optional) system prompt");
             out.println("  --temperature, -temp <float>  temperature in [0,inf], default 0.1");
@@ -209,6 +365,7 @@ public class Llama3 {
             boolean interactive = false;
             boolean stream = true;
             boolean echo = false;
+            String serverHostPort = null;
 
             for (int i = 0; i < args.length; i++) {
                 String optionName = args[i];
@@ -234,6 +391,11 @@ public class Llama3 {
                         switch (optionName) {
                             case "--prompt", "-p" -> prompt = nextArg;
                             case "--system-prompt", "-sp" -> systemPrompt = nextArg;
+                            case "--server" -> {
+                                // java --enable-preview --add-modules=jdk.incubator.vector -cp . com.llama4j.Llama3 --model llama/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf --seed 0 --server 127.0.0.1:8089
+                                serverHostPort = nextArg;
+                                prompt = ""; // prompt will be sent via network.
+                            }
                             case "--temperature", "--temp" -> temperature = Float.parseFloat(nextArg);
                             case "--top-p" -> topp = Float.parseFloat(nextArg);
                             case "--model", "-m" -> modelPath = Paths.get(nextArg);
@@ -246,7 +408,7 @@ public class Llama3 {
                     }
                 }
             }
-            return new Options(modelPath, prompt, systemPrompt, interactive, temperature, topp, seed, maxTokens, stream, echo);
+            return new Options(modelPath, prompt, systemPrompt, interactive, serverHostPort, temperature, topp, seed, maxTokens, stream, echo);
         }
     }
 
@@ -254,7 +416,9 @@ public class Llama3 {
         Options options = Options.parseOptions(args);
         Llama model = ModelLoader.loadModel(options.modelPath(), options.maxTokens());
         Sampler sampler = selectSampler(model.configuration().vocabularySize, options.temperature(), options.topp(), options.seed());
-        if (options.interactive()) {
+        if (options.serverHostPort() != null) {
+            startLlmServer(model, sampler, options);
+        } else if (options.interactive()) {
             runInteractive(model, sampler, options);
         } else {
             runInstructOnce(model, sampler, options);
@@ -2099,5 +2263,3 @@ class ChatFormat {
         }
     }
 }
-
-
